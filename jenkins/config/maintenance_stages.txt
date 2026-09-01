@@ -19,3 +19,8 @@
 #
 # Blank lines and lines starting with '#' are ignored. No active entries mean
 # that no stages are skipped for resource maintenance.
+
+A10-PyTorch-2 | Parent PR addition validation
+DGX_H100-* | Parent wildcard addition validation
+Does-Not-Exist-* | Parent unmatched-pattern validation
+A10-PyTorch-2 | Duplicate entry should warn and keep the first reason
