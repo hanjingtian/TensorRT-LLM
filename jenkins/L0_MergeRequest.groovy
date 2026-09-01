@@ -154,6 +154,14 @@ def CBTS_COVERAGE = "cbts_coverage"
 def DISABLE_CBTS = "disable_cbts"
 @Field
 def INFRA_DRY_RUN = "infra_dry_run"
+@Field
+def MAINTENANCE_ENTRIES = "maintenance_entries"
+@Field
+def MAINTENANCE_CONFIG_SHA = "maintenance_config_sha"
+@Field
+def MAINTENANCE_CONFIG_WARNINGS = "maintenance_config_warnings"
+@Field
+def MAINTENANCE_CONFIG_PATH = "jenkins/config/maintenance_stages.txt"
 // Kill switch for CBTS per-test coverage; official post-merge pipeline only, single-GPU stages only in Phase 1.
 @Field
 def ENABLE_CBTS_COVERAGE = true
@@ -203,6 +211,8 @@ def GITHUB_PR_API_URL = "github_pr_api_url"
 @Field
 def CACHED_CHANGED_FILE_LIST = "cached_changed_file_list"
 @Field
+def CACHED_CHANGED_FILE_LIST_ERROR = "cached_changed_file_list_error"
+@Field
 def ACTION_INFO = "action_info"
 @Field
 def IMAGE_KEY_TO_TAG = "image_key_to_tag"
@@ -214,14 +224,20 @@ def TRTLLM_VERSION_OVERRIDE = "trtllm_version_override"
 def RUN_MODE = "run_mode"
 @Field
 def BUILD_BRANCH = "build_branch"
+@Field
+def MERGE_REQUEST_FILE_CHANGES_CACHE = ".merge_request_file_changes"
 def globalVars = [
     (GITHUB_PR_API_URL): gitlabParamsFromBot.get('github_pr_api_url', null),
     (CACHED_CHANGED_FILE_LIST): null,
+    (CACHED_CHANGED_FILE_LIST_ERROR): null,
     (ACTION_INFO): gitlabParamsFromBot.get('action_info', null),
     (IMAGE_KEY_TO_TAG): [:],
     (TARGET_BRANCH): gitlabParamsFromBot.get('target_branch', 'main'),
     (TRTLLM_VERSION_OVERRIDE): null,
     (RUN_MODE): runMode,
+    (MAINTENANCE_ENTRIES): [],
+    (MAINTENANCE_CONFIG_SHA): null,
+    (MAINTENANCE_CONFIG_WARNINGS): [],
 ]
 globalVars[BUILD_BRANCH] = resolveBuildBranch(globalVars)
 if (runMode == "nightly_release") {
@@ -411,6 +427,303 @@ def setupPipelineEnvironment(pipeline, testFilter, globalVars)
     getContainerURIs().each { k, v ->
         globalVars[k] = v
     }
+    if (!GEN_POST_MERGE_BUILDS_ONLY) {
+        resolveMaintenanceConfig(pipeline, globalVars)
+    }
+}
+
+def getTargetBranchTotCommit(pipeline, globalVars)
+{
+    if (globalVars[MAINTENANCE_CONFIG_SHA]) {
+        return globalVars[MAINTENANCE_CONFIG_SHA]
+    }
+
+    def targetBranch = env.gitlabTargetBranch ?: globalVars[TARGET_BRANCH]
+    withCredentials([
+        usernamePassword(
+            credentialsId: 'svc_tensorrt_gitlab_api_token',
+            usernameVariable: 'GITHUB_USER',
+            passwordVariable: 'GITHUB_PASSWORD'
+        )
+    ]) {
+        def apiUrl = "https://api.github.com/repos/NVIDIA/TensorRT-LLM/commits?sha=${targetBranch}&per_page=1"
+        def connection = new URL(apiUrl).openConnection()
+        connection.setRequestProperty(
+            "Authorization",
+            "Basic " + "${GITHUB_USER}:${GITHUB_PASSWORD}".bytes.encodeBase64().toString()
+        )
+        connection.setRequestMethod("GET")
+        def response = connection.inputStream.text
+        def json = new JsonSlurper().parseText(response)
+        if (!json || !json[0]?.sha) {
+            error "Cannot resolve the latest commit for target branch '${targetBranch}'."
+        }
+        globalVars[MAINTENANCE_CONFIG_SHA] = json[0].sha
+    }
+
+    pipeline.echo("Target branch TOT commit: ${globalVars[MAINTENANCE_CONFIG_SHA]}")
+    return globalVars[MAINTENANCE_CONFIG_SHA]
+}
+
+def parseMaintenanceEntryLine(String rawLine, String source, int lineNumber)
+{
+    def line = rawLine.trim()
+    if (!line || line.startsWith('#')) {
+        return null
+    }
+
+    def separator = line.indexOf('|')
+    if (separator <= 0 || separator == line.length() - 1) {
+        error "Invalid maintenance entry at ${source}:${lineNumber}. " +
+              "Expected '<stage-or-pattern> | <reason>'."
+    }
+
+    def pattern = line.substring(0, separator).trim()
+    def reason = line.substring(separator + 1).trim()
+    if (!pattern || !reason) {
+        error "Invalid maintenance entry at ${source}:${lineNumber}. " +
+              "Both stage pattern and reason are required."
+    }
+    return [pattern: pattern, reason: reason]
+}
+
+def parseMaintenanceConfig(String content, String source)
+{
+    def entries = []
+    def warnings = []
+    def firstLineByPattern = [:]
+    content.readLines().eachWithIndex { rawLine, index ->
+        def lineNumber = index + 1
+        def entry = parseMaintenanceEntryLine(rawLine, source, lineNumber)
+        if (entry == null) {
+            return
+        }
+        if (firstLineByPattern.containsKey(entry.pattern)) {
+            warnings.add(
+                "Duplicate maintenance pattern '${entry.pattern}' at ${source}:${lineNumber}; " +
+                "the first entry at line ${firstLineByPattern[entry.pattern]} is used."
+            )
+            return
+        }
+        firstLineByPattern[entry.pattern] = lineNumber
+        entries.add(entry)
+    }
+    return [entries: entries, warnings: warnings]
+}
+
+def parseMaintenanceDiff(String diff)
+{
+    def additions = []
+    def deletions = []
+    diff.readLines().eachWithIndex { rawLine, index ->
+        if (rawLine.startsWith('+++') || rawLine.startsWith('---')) {
+            return
+        }
+        if (!rawLine.startsWith('+') && !rawLine.startsWith('-')) {
+            return
+        }
+        def entry = parseMaintenanceEntryLine(
+            rawLine.substring(1),
+            "${MAINTENANCE_CONFIG_PATH} PR diff",
+            index + 1
+        )
+        if (entry == null) {
+            return
+        }
+        if (rawLine.startsWith('+')) {
+            additions.add(entry)
+        } else {
+            deletions.add(entry)
+        }
+    }
+    return [additions: additions, deletions: deletions]
+}
+
+def mergeMaintenanceEntries(List totEntries, List currentEntries, Map changes)
+{
+    def effectiveByPattern = new LinkedHashMap()
+    totEntries.each { entry -> effectiveByPattern[entry.pattern] = entry }
+
+    def currentByPattern = new LinkedHashMap()
+    currentEntries.each { entry ->
+        if (!currentByPattern.containsKey(entry.pattern)) {
+            currentByPattern[entry.pattern] = entry
+        }
+    }
+
+    // A duplicate line can be removed while the effective (first) entry stays
+    // in the file. Treat a pattern as deleted only when it is absent from the
+    // PR file after the change.
+    def deletedPatterns = changes.deletions.collect { entry -> entry.pattern } as Set
+    deletedPatterns.findAll { pattern -> !currentByPattern.containsKey(pattern) }.each { pattern ->
+        effectiveByPattern.remove(pattern)
+    }
+
+    def addedPatterns = changes.additions.collect { entry -> entry.pattern } as Set
+    addedPatterns.each { pattern ->
+        if (!currentByPattern.containsKey(pattern)) {
+            error "PR diff adds maintenance pattern '${pattern}', but it is missing from " +
+                  "${MAINTENANCE_CONFIG_PATH}."
+        }
+        // Applying additions after deletions makes a reason-only edit take effect
+        // immediately in the PR while preserving the configured stage skip.
+        effectiveByPattern[pattern] = currentByPattern[pattern]
+    }
+
+    // Preserve the PR file's explicit ordering for patterns it knows about. Any
+    // entries added to TOT after a stale PR branched are appended in trusted TOT
+    // order instead of being mistaken for deletions.
+    def effectiveEntries = []
+    def emittedPatterns = [] as Set
+    currentEntries.each { entry ->
+        if (effectiveByPattern.containsKey(entry.pattern) && !emittedPatterns.contains(entry.pattern)) {
+            effectiveEntries.add(effectiveByPattern[entry.pattern])
+            emittedPatterns.add(entry.pattern)
+        }
+    }
+    totEntries.each { entry ->
+        if (effectiveByPattern.containsKey(entry.pattern) && !emittedPatterns.contains(entry.pattern)) {
+            effectiveEntries.add(effectiveByPattern[entry.pattern])
+            emittedPatterns.add(entry.pattern)
+        }
+    }
+    return effectiveEntries
+}
+
+def readTotMaintenanceConfig(pipeline, globalVars, String totCommit)
+{
+    def targetBranch = env.gitlabTargetBranch ?: globalVars[TARGET_BRANCH]
+    def outputFile = "maintenance_stages_TOT_${totCommit}.txt"
+    def fetched = false
+    try {
+        sh "wget --quiet https://urm.nvidia.com/artifactory/vcs-remote/NVIDIA/TensorRT-LLM/raw/${totCommit}/${MAINTENANCE_CONFIG_PATH} -O ${outputFile}"
+        fetched = true
+    } catch (InterruptedException e) {
+        throw e
+    } catch (Exception e) {
+        pipeline.echo("Failed to read the TOT maintenance config through Artifactory: ${e.toString()}")
+    }
+
+    if (!fetched) {
+        try {
+            withCredentials([string(credentialsId: 'default-llm-repo', variable: 'DEFAULT_LLM_REPO')]) {
+                trtllm_utils.checkoutFile(
+                    DEFAULT_LLM_REPO,
+                    targetBranch,
+                    MAINTENANCE_CONFIG_PATH,
+                    "."
+                )
+            }
+            sh "mv maintenance_stages.txt ${outputFile}"
+            fetched = true
+        } catch (InterruptedException e) {
+            throw e
+        } catch (Exception e) {
+            pipeline.echo("Failed to read the TOT maintenance config from the internal repository: ${e.toString()}")
+        }
+    }
+
+    if (!fetched || !fileExists(outputFile)) {
+        error "Required maintenance config '${MAINTENANCE_CONFIG_PATH}' is missing or cannot be read " +
+              "from target branch '${targetBranch}' at ${totCommit}."
+    }
+    return readFile(outputFile)
+}
+
+def uploadMaintenanceResolution(pipeline, Map resolution)
+{
+    if (!resolution.config_changed_in_pr &&
+        !resolution.effective_entries &&
+        !resolution.warnings) {
+        return
+    }
+    try {
+        def reportFile = "maintenance-config-resolution.json"
+        writeFile file: reportFile, text: JsonOutput.prettyPrint(JsonOutput.toJson(resolution))
+        trtllm_utils.uploadArtifacts(reportFile, "${UPLOAD_PATH}/maintenance/")
+        pipeline.echo(
+            "Maintenance config resolution: " +
+            "https://urm.nvidia.com/artifactory/${UPLOAD_PATH}/maintenance/${reportFile}"
+        )
+    } catch (InterruptedException e) {
+        throw e
+    } catch (Exception e) {
+        pipeline.echo("WARNING: Failed to upload maintenance config resolution: ${e.toString()}")
+    }
+}
+
+def resolveMaintenanceConfig(pipeline, globalVars)
+{
+    def currentFile = "${LLM_ROOT}/${MAINTENANCE_CONFIG_PATH}"
+    def totCommit = getTargetBranchTotCommit(pipeline, globalVars)
+    def totConfig = parseMaintenanceConfig(
+        readTotMaintenanceConfig(pipeline, globalVars, totCommit),
+        "${MAINTENANCE_CONFIG_PATH}@${totCommit}"
+    )
+
+    def isOfficialPostMergeJob = (env.JOB_NAME ==~ /.*PostMerge.*/)
+    def prDiffDisabled =
+        (params.InfraDryRun?.toString()?.toBoolean() ?: false) ||
+        env.alternativeTRT ||
+        isOfficialPostMergeJob ||
+        runMode == "nightly_release"
+    def changedFiles = prDiffDisabled ? [] : getMergeRequestChangedFileList(pipeline, globalVars)
+    if (!prDiffDisabled && globalVars[CACHED_CHANGED_FILE_LIST_ERROR]) {
+        error "Cannot determine whether ${MAINTENANCE_CONFIG_PATH} changed in this PR: " +
+              globalVars[CACHED_CHANGED_FILE_LIST_ERROR]
+    }
+    def configChangedInPr = changedFiles.contains(MAINTENANCE_CONFIG_PATH)
+    if (configChangedInPr && !fileExists(currentFile)) {
+        error "Required maintenance config '${MAINTENANCE_CONFIG_PATH}' was deleted or renamed " +
+              "in ${env.gitlabCommit}. Deleting or renaming this file is not allowed."
+    }
+
+    def changes = [additions: [], deletions: []]
+    def effectiveEntries = totConfig.entries
+    def currentConfig = [entries: [], warnings: []]
+    if (configChangedInPr) {
+        currentConfig = parseMaintenanceConfig(
+            readFile(currentFile),
+            "${MAINTENANCE_CONFIG_PATH}@${env.gitlabCommit}"
+        )
+        def diff = getMergeRequestOneFileChanges(
+            pipeline,
+            globalVars,
+            MAINTENANCE_CONFIG_PATH
+        )
+        if (!diff) {
+            error "${MAINTENANCE_CONFIG_PATH} is listed as changed, but its PR diff is unavailable."
+        }
+        changes = parseMaintenanceDiff(diff)
+        effectiveEntries = mergeMaintenanceEntries(
+            totConfig.entries,
+            currentConfig.entries,
+            changes
+        )
+    }
+
+    def warnings = (
+        totConfig.warnings +
+        (configChangedInPr ? currentConfig.warnings : [])
+    ).unique()
+    warnings.each { warning -> pipeline.echo("WARNING: ${warning}") }
+    globalVars[MAINTENANCE_ENTRIES] = effectiveEntries
+    globalVars[MAINTENANCE_CONFIG_SHA] = totCommit
+    globalVars[MAINTENANCE_CONFIG_WARNINGS] = warnings
+
+    pipeline.echo("Effective maintenance entries: ${effectiveEntries}")
+    uploadMaintenanceResolution(pipeline, [
+        schema_version: 1,
+        config_path: MAINTENANCE_CONFIG_PATH,
+        config_sha: totCommit,
+        source_commit: env.gitlabCommit,
+        config_changed_in_pr: configChangedInPr,
+        additions: changes.additions,
+        deletions: changes.deletions,
+        effective_entries: effectiveEntries,
+        warnings: warnings,
+        build_url: env.BUILD_URL,
+    ])
 }
 
 def mergeWaiveList(pipeline, globalVars)
@@ -422,22 +735,13 @@ def mergeWaiveList(pipeline, globalVars)
 
     // Get TOT waive list
     LLM_TOT_ROOT = "llm-tot"
-    targetBranch = env.gitlabTargetBranch ? env.gitlabTargetBranch : globalVars[TARGET_BRANCH]
+    def targetBranch = env.gitlabTargetBranch ?: globalVars[TARGET_BRANCH]
     echo "Target branch: ${targetBranch}"
 
     def targetBranchTOTCommit = ""
     def isGetTOTWaiveList = false
     try {
-        withCredentials([usernamePassword(credentialsId: 'svc_tensorrt_gitlab_api_token', usernameVariable: 'GITHUB_USER', passwordVariable: 'GITHUB_PASSWORD')]) {
-            def apiUrl = "https://api.github.com/repos/NVIDIA/TensorRT-LLM/commits?sha=${targetBranch}&per_page=1"
-            def connection = new URL(apiUrl).openConnection()
-            connection.setRequestProperty("Authorization", "Basic " + "${GITHUB_USER}:${GITHUB_PASSWORD}".bytes.encodeBase64().toString())
-            connection.setRequestMethod("GET")
-            def response = connection.inputStream.text
-            def json = new JsonSlurper().parseText(response)
-            targetBranchTOTCommit = json[0].sha
-        }
-        echo "Target branch TOT commit: ${targetBranchTOTCommit}"
+        targetBranchTOTCommit = getTargetBranchTotCommit(pipeline, globalVars)
         sh "wget https://urm.nvidia.com/artifactory/vcs-remote/NVIDIA/TensorRT-LLM/raw/${targetBranchTOTCommit}/tests/integration/test_lists/waives.txt -O waives_TOT_${targetBranchTOTCommit}.txt"
         isGetTOTWaiveList = true
     } catch (InterruptedException e) {
@@ -471,7 +775,11 @@ def mergeWaiveList(pipeline, globalVars)
 
     try {
         // Get waive list diff in current MR
-        def diff = getMergeRequestOneFileChanges(pipeline, globalVars, "tests/integration/test_lists/waives.txt")
+        def diff = getMergeRequestOneFileChanges(
+            pipeline,
+            globalVars,
+            "tests/integration/test_lists/waives.txt"
+        )
 
         // Write diff to a temporary file to avoid shell escaping issues
         writeFile file: 'diff_content.txt', text: diff
@@ -528,6 +836,10 @@ def preparation(pipeline, testFilter, globalVars)
                 mergeWaiveList(pipeline, globalVars)
             }
         }
+        // The changed-file list is used only during setup and must never be
+        // serialized into downstream job parameters.
+        globalVars.remove(CACHED_CHANGED_FILE_LIST)
+        globalVars.remove(CACHED_CHANGED_FILE_LIST_ERROR)
     })
 }
 
@@ -811,29 +1123,45 @@ def getMergeRequestChangedFileList(pipeline, globalVars) {
         return []
     }
 
-    def githubPrApiUrl = globalVars[GITHUB_PR_API_URL]
-
     if (globalVars[CACHED_CHANGED_FILE_LIST] != null) {
         return globalVars[CACHED_CHANGED_FILE_LIST]
     }
     try {
-        def changedFileList = []
-        if (githubPrApiUrl != null) {
-            changedFileList = getGithubMRChangedFile(pipeline, githubPrApiUrl, "getChangedFileList")
-        } else {
-            changedFileList = getGitlabMRChangedFile(pipeline, "getChangedFileList")
-        }
+        def githubPrApiUrl = globalVars[GITHUB_PR_API_URL]
+        def changedFileList = githubPrApiUrl != null
+            ? getGithubMRChangedFile(pipeline, githubPrApiUrl, "getChangedFileList")
+            : getGitlabMRChangedFile(pipeline, "getChangedFileList")
         def changedFileListStr = changedFileList.join(",\n")
         pipeline.echo("The changeset of this MR is: ${changedFileListStr}.")
         globalVars[CACHED_CHANGED_FILE_LIST] = changedFileList
+        globalVars[CACHED_CHANGED_FILE_LIST_ERROR] = null
         return globalVars[CACHED_CHANGED_FILE_LIST]
     } catch (InterruptedException e) {
         throw e
     } catch (Exception e) {
         pipeline.echo("Get merge request changed file list failed. Error: ${e.toString()}")
         globalVars[CACHED_CHANGED_FILE_LIST] = []
+        globalVars[CACHED_CHANGED_FILE_LIST_ERROR] = e.toString()
         return globalVars[CACHED_CHANGED_FILE_LIST]
     }
+}
+
+def getMergeRequestFileChanges(pipeline, globalVars) {
+    def cacheFile = "${MERGE_REQUEST_FILE_CHANGES_CACHE}.${env.gitlabCommit ?: env.BUILD_NUMBER}.json"
+    if (fileExists(cacheFile)) {
+        return readJSON(file: cacheFile, returnPojo: true)
+    }
+
+    def githubPrApiUrl = globalVars[GITHUB_PR_API_URL]
+    def fileChanges = githubPrApiUrl != null
+        ? getGithubMRChangedFile(pipeline, githubPrApiUrl, "getFileChanges")
+        : getGitlabMRChangedFile(pipeline, "getFileChanges")
+    fileChanges = fileChanges ?: [:]
+    writeFile(
+        file: cacheFile,
+        text: JsonOutput.toJson(fileChanges)
+    )
+    return fileChanges
 }
 
 def getMergeRequestOneFileChanges(pipeline, globalVars, filePath) {
@@ -848,14 +1176,7 @@ def getMergeRequestOneFileChanges(pipeline, globalVars, filePath) {
         return ""
     }
 
-    def githubPrApiUrl = globalVars[GITHUB_PR_API_URL]
-    def diff = ""
-
-    if (githubPrApiUrl != null) {
-        diff = getGithubMRChangedFile(pipeline, githubPrApiUrl, "getOneFileChanges", filePath)
-    } else {
-        diff = getGitlabMRChangedFile(pipeline, "getOneFileChanges", filePath)
-    }
+    def diff = getMergeRequestFileChanges(pipeline, globalVars)[filePath] ?: ""
     pipeline.echo("The change of ${filePath} is: ${diff}")
     return diff
 }
@@ -951,10 +1272,7 @@ def getCbtsResult(pipeline, testFilter, globalVars)
         }
         def diffs = [:]
         if (filesNeedingDiff) {
-            def githubPrApiUrl = globalVars[GITHUB_PR_API_URL]
-            def fileChanges = githubPrApiUrl != null
-                ? getGithubMRChangedFile(pipeline, githubPrApiUrl, "getFileChanges")
-                : getGitlabMRChangedFile(pipeline, "getFileChanges")
+            def fileChanges = getMergeRequestFileChanges(pipeline, globalVars)
             diffs = filesNeedingDiff.collectEntries { filePath ->
                 // Null (patch omitted for binary / rename / too-large diffs) coerces to empty.
                 [(filePath): fileChanges[filePath] ?: ""]
@@ -1524,6 +1842,128 @@ def uploadArchCoverage(String arch, pipeline, testFilter) {
     }
 }
 
+def collectMaintenanceReports(pipeline, globalVars)
+{
+    def maintenanceEntries = globalVars[MAINTENANCE_ENTRIES] ?: []
+    def configWarnings = globalVars[MAINTENANCE_CONFIG_WARNINGS] ?: []
+    if (!maintenanceEntries && !configWarnings) {
+        return
+    }
+
+    try {
+        stage("Collect Maintenance Report") {
+            def maintenanceLink =
+                "https://urm.nvidia.com/artifactory/${UPLOAD_PATH}/maintenance"
+            sh "rm -rf maintenance-reports && mkdir -p maintenance-reports"
+            trtllm_utils.llmExecStepWithRetry(
+                pipeline,
+                script: "wget -nv '${maintenanceLink}/' -O maintenance-reports/index.html",
+                allowStepFailed: true
+            )
+            sh '''
+                grep -oE 'href="[^"]+\\.json"' maintenance-reports/index.html \
+                    | cut -d '"' -f 2 \
+                    | sed 's#^.*/##' \
+                    | grep -E '^maintenance-.*\\.json$' \
+                    | sort -u > maintenance-reports/file-names.txt || true
+            '''
+
+            def reportNames = readFile("maintenance-reports/file-names.txt")
+                .readLines()
+                .findAll { name -> name }
+            reportNames.each { reportName ->
+                trtllm_utils.llmExecStepWithRetry(
+                    pipeline,
+                    script: "wget -c -nv '${maintenanceLink}/${reportName}' " +
+                        "-O 'maintenance-reports/${reportName}'",
+                    allowStepFailed: true
+                )
+            }
+
+            def childReports = findFiles(glob: 'maintenance-reports/maintenance-*.json')
+                .collect { reportFile ->
+                    try {
+                        return readJSON(file: reportFile.path, returnPojo: true)
+                    } catch (Exception e) {
+                        pipeline.echo(
+                            "WARNING: Cannot parse maintenance report ${reportFile.name}: " +
+                            e.toString()
+                        )
+                        return null
+                    }
+                }
+                .findAll { report ->
+                    report != null &&
+                    report.containsKey('resolution') &&
+                    report.containsKey('skipped_stages')
+                }
+
+            def resolution = maintenanceEntries.collect { entry ->
+                def matchedStages = childReports.collectMany { report ->
+                    (report.resolution ?: [])
+                        .findAll { resolved -> resolved.pattern == entry.pattern }
+                        .collectMany { resolved -> resolved.matched_stages ?: [] }
+                }.collect { stageName -> stageName.toString() }.unique().sort()
+                [
+                    pattern: entry.pattern,
+                    reason: entry.reason,
+                    matched_stages: matchedStages,
+                ]
+            }
+            def skippedStages = childReports.collectMany { report ->
+                report.skipped_stages ?: []
+            }
+            def warnings = (
+                configWarnings +
+                childReports.collectMany { report -> report.warnings ?: [] }
+            ).collect { warning -> warning.toString() }.unique()
+            resolution.findAll { entry -> !entry.matched_stages }.each { entry ->
+                warnings.add(
+                    "Maintenance pattern '${entry.pattern}' matched no stage reported by any " +
+                    "downstream job."
+                )
+            }
+
+            def summaryFile = "maintenance-summary.json"
+            def summary = [
+                schema_version: 1,
+                config_path: MAINTENANCE_CONFIG_PATH,
+                config_sha: globalVars[MAINTENANCE_CONFIG_SHA],
+                source_commit: env.gitlabCommit,
+                build_url: env.BUILD_URL,
+                configured_entries: maintenanceEntries,
+                resolution: resolution,
+                skipped_stages: skippedStages,
+                warnings: warnings.unique(),
+                child_builds: childReports.collect { report ->
+                    [
+                        job_name: report.job_name,
+                        build_number: report.build_number,
+                        build_url: report.build_url,
+                    ]
+                },
+                generated_at_utc: new Date().format(
+                    "yyyy-MM-dd'T'HH:mm:ss'Z'",
+                    TimeZone.getTimeZone('UTC')
+                ),
+            ]
+            writeFile file: summaryFile, text: JsonOutput.prettyPrint(JsonOutput.toJson(summary))
+            trtllm_utils.uploadArtifacts(summaryFile, "${UPLOAD_PATH}/maintenance/")
+            def summaryUrl = "${maintenanceLink}/${summaryFile}"
+            pipeline.echo("Maintenance summary: ${summaryUrl}")
+            def description = currentBuild.description ?: ""
+            currentBuild.description = description +
+                (description ? "<br/>" : "") +
+                "Maintenance skipped ${skippedStages.size()} stage(s): " +
+                "<a href='${summaryUrl}'>summary</a>"
+        }
+    } catch (InterruptedException e) {
+        throw e
+    } catch (Exception e) {
+        pipeline.echo("WARNING: Failed to collect maintenance reports: ${e.toString()}")
+    }
+}
+
 def collectTestResults(pipeline, testFilter, globalVars)
 {
     collectResultPodSpec = createKubernetesPodConfig("", "agent")
@@ -1736,6 +2176,7 @@ def collectTestResults(pipeline, testFilter, globalVars)
             }
         }
         parallel parallelTasks
+        collectMaintenanceReports(pipeline, globalVars)
     })
 }
 
@@ -1762,7 +2203,9 @@ def launchJob(pipeline, jobName, reuseBuild, enableFailFast, globalVars, platfor
     // Build a local copy to avoid racey growth from shared parallel mutations.
     // In particular, CACHED_CHANGED_FILE_LIST can become very large and may
     // trigger "Argument list too long" when passed to downstream jobs.
-    def globalVarsToPass = globalVars.findAll { key, value -> key != CACHED_CHANGED_FILE_LIST }
+    def globalVarsToPass = globalVars.findAll { key, value ->
+        key != CACHED_CHANGED_FILE_LIST && key != CACHED_CHANGED_FILE_LIST_ERROR
+    }
     String globalVarsJson = writeJSON returnText: true, json: globalVarsToPass
     parameters += [
         'enableFailFast': enableFailFast,
@@ -2579,6 +3022,7 @@ pipeline {
                         // globalVars[CACHED_CHANGED_FILE_LIST] is only used in setupPipelineEnvironment
                         // Remove it to workaround the "Argument list too long" error
                         globalVars.remove(CACHED_CHANGED_FILE_LIST)
+                        globalVars.remove(CACHED_CHANGED_FILE_LIST_ERROR)
                         launchStages(this, reuseBuild, testFilter, enableFailFast, globalVars)
                     }
                 }
