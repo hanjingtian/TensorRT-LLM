@@ -2930,6 +2930,146 @@ def stageMatchesAnyPattern(String key, List patterns) {
     return patterns.any { pattern -> stageMatchesPattern(key, pattern) }
 }
 
+def findMaintenanceMatches(String key, List maintenanceEntries) {
+    return (maintenanceEntries ?: []).findAll { entry ->
+        stageMatchesPattern(key, entry.pattern.toString())
+    }
+}
+
+def getMaintenanceMatchKey(String stageName) {
+    return stageName.endsWith(CBTS_STAGE_SUFFIX) ?
+        stageName.substring(0, stageName.length() - CBTS_STAGE_SUFFIX.length()) :
+        stageName
+}
+
+def getMaintenanceSkipLabel(String reason) {
+    def displayReason = reason.replaceAll(/\s+/, ' ').replaceAll(/[<>]/, '').trim()
+    def maxReasonLength = 80
+    if (displayReason.length() > maxReasonLength) {
+        displayReason = displayReason.substring(0, maxReasonLength - 3) + "..."
+    }
+    return displayReason ? "Skip - Maintenance: ${displayReason}" : "Skip - Maintenance"
+}
+
+def prepareMaintenanceResolution(
+    Collection stageNames,
+    Map globalVars
+) {
+    def maintenanceEntries = globalVars[MAINTENANCE_ENTRIES] ?: []
+    def inventory = (stageNames ?: []).collect { stageName -> stageName.toString() }.unique().sort()
+    def resolution = maintenanceEntries.collect { entry ->
+        def matchedStages = inventory.findAll { stageName ->
+            stageMatchesPattern(stageName, entry.pattern.toString())
+        }
+        [
+            pattern: entry.pattern,
+            reason: entry.reason,
+            matched_stages: matchedStages,
+        ]
+    }
+
+    def warnings = (globalVars[MAINTENANCE_CONFIG_WARNINGS] ?: []).collect { it.toString() }
+    inventory.each { stageName ->
+        def matches = findMaintenanceMatches(stageName, maintenanceEntries)
+        if (matches.size() > 1) {
+            warnings.add(
+                "Stage '${stageName}' matches multiple maintenance patterns " +
+                "${matches.collect { entry -> entry.pattern }}; the first entry is used."
+            )
+        }
+    }
+
+    GlobalState.maintenanceResolution = resolution
+    GlobalState.maintenanceWarnings = warnings.unique()
+}
+
+def recordMaintenanceSkip(
+    String stageName,
+    String matchKey,
+    String scope,
+    List matches
+) {
+    def selected = matches[0]
+    def lockName = "maintenance-report-${env.JOB_NAME}-${env.BUILD_NUMBER}".replaceAll(
+        /[^A-Za-z0-9_.-]/,
+        '_'
+    )
+    lock(resource: lockName) {
+        GlobalState.maintenanceSkipRecords.add([
+            stage: stageName,
+            match_key: matchKey,
+            scope: scope,
+            matched_patterns: matches.collect { entry -> entry.pattern },
+            selected_pattern: selected.pattern,
+            reason: selected.reason,
+        ])
+    }
+}
+
+def showMaintenanceSkip(
+    String stageName,
+    String matchKey,
+    String scope,
+    List matches,
+    String configSha
+) {
+    def selected = matches[0]
+    recordMaintenanceSkip(stageName, matchKey, scope, matches)
+    stage(getMaintenanceSkipLabel(selected.reason.toString())) {
+        echo "Skip - ${scope} resource maintenance is in progress. No test agent was launched."
+        echo "Maintenance stage: ${stageName}"
+        echo "Maintenance pattern: ${selected.pattern}"
+        echo "Maintenance reason: ${selected.reason}"
+        echo "Maintenance config SHA: ${configSha}"
+    }
+}
+
+def uploadMaintenanceReport(pipeline, Map globalVars) {
+    def maintenanceEntries = globalVars[MAINTENANCE_ENTRIES] ?: []
+    if (!maintenanceEntries &&
+        !GlobalState.maintenanceSkipRecords &&
+        !GlobalState.maintenanceWarnings) {
+        return
+    }
+
+    try {
+        def safeJobName = env.JOB_NAME.replaceAll(/[^A-Za-z0-9_.-]/, '_')
+        def reportFile = "maintenance-${safeJobName}-${env.BUILD_NUMBER}.json"
+        def report = [
+            schema_version: 1,
+            job_name: env.JOB_NAME,
+            build_number: env.BUILD_NUMBER,
+            build_url: env.BUILD_URL,
+            source_commit: env.gitlabCommit,
+            config_sha: globalVars[MAINTENANCE_CONFIG_SHA],
+            configured_entries: maintenanceEntries,
+            resolution: GlobalState.maintenanceResolution,
+            skipped_stages: GlobalState.maintenanceSkipRecords,
+            warnings: GlobalState.maintenanceWarnings,
+            generated_at_utc: new Date().format(
+                "yyyy-MM-dd'T'HH:mm:ss'Z'",
+                TimeZone.getTimeZone('UTC')
+            ),
+        ]
+        writeFile file: reportFile, text: JsonOutput.prettyPrint(JsonOutput.toJson(report))
+        trtllm_utils.uploadArtifacts(reportFile, "${UPLOAD_PATH}/maintenance/")
+        def reportUrl =
+            "https://urm.nvidia.com/artifactory/${UPLOAD_PATH}/maintenance/${reportFile}"
+        pipeline.echo("Maintenance report: ${reportUrl}")
+        if (GlobalState.maintenanceSkipRecords) {
+            def description = currentBuild.description ?: ""
+            currentBuild.description = description +
+                (description ? "<br/>" : "") +
+                "Maintenance skipped ${GlobalState.maintenanceSkipRecords.size()} stage(s): " +
+                "<a href='${reportUrl}'>report</a>"
+        }
+    } catch (InterruptedException e) {
+        throw e
+    } catch (Exception e) {
+        pipeline.echo("WARNING: Failed to upload maintenance report: ${e.toString()}")
+    }
+}
+
 // Test filter flags
 // Multi-GPU stages matching any entry here run inside the single-GPU job
 // instead of waiting for the separate multi-GPU dispatch (which requires
@@ -3022,6 +3162,19 @@ def IMAGE_KEY_TO_TAG = "image_key_to_tag"
 def TRTLLM_VERSION_OVERRIDE = "trtllm_version_override"
 @Field
 def RUN_MODE = "run_mode"
+@Field
+def MAINTENANCE_ENTRIES = "maintenance_entries"
+@Field
+def MAINTENANCE_CONFIG_SHA = "maintenance_config_sha"
+@Field
+def MAINTENANCE_CONFIG_WARNINGS = "maintenance_config_warnings"
+@Field
+def IMAGE_SANITY_STAGE_NAMES = [
+    "NGC-Devel-Image-amd64-Sanity-Test",
+    "NGC-Devel-Image-arm64-Sanity-Test",
+    "NGC-Release-Image-amd64-Sanity-Test-A10",
+    "NGC-Release-Image-arm64-Sanity-Test-GH200",
+]
 def globalVars = [
     (GITHUB_PR_API_URL): null,
     (CACHED_CHANGED_FILE_LIST): null,
@@ -3029,12 +3182,18 @@ def globalVars = [
     (IMAGE_KEY_TO_TAG): [:],
     (TRTLLM_VERSION_OVERRIDE): null,
     (RUN_MODE): null,
+    (MAINTENANCE_ENTRIES): [],
+    (MAINTENANCE_CONFIG_SHA): null,
+    (MAINTENANCE_CONFIG_WARNINGS): [],
 ]
 
 class GlobalState {
     static def uploadResultStageNames = []
     static def stageAttemptEstimateMs = [:]
     static def stageAttemptEstimateDetails = [:]
+    static def maintenanceResolution = []
+    static def maintenanceSkipRecords = []
+    static def maintenanceWarnings = []
 
     // HOST_NODE_NAME to starting port section map
     // This map maintains the next available starting port for each host node
@@ -7030,6 +7189,10 @@ def launchTestJobs(pipeline, testFilter, globalVars)
     }
 
     checkStageName(fullSet)
+    // Include image-sanity stages only in maintenance resolution so an
+    // image-only pattern is not reported as globally unmatched. Do not add
+    // them to fullSet, which would change existing --stage-list validation.
+    prepareMaintenanceResolution(fullSet + IMAGE_SANITY_STAGE_NAMES, globalVars)
 
     if (testFilter[(TEST_STAGE_LIST)] != null) {
         checkStageNameSet(testFilter[(TEST_STAGE_LIST)], fullSet, TEST_STAGE_LIST)
@@ -7057,13 +7220,28 @@ def launchTestJobs(pipeline, testFilter, globalVars)
     stageInfraScope = [:]
     parallelJobsFiltered = parallelJobsFiltered.collectEntries { key, values ->
         def stageOpts = (values instanceof List && values.size() >= 3 && values[2] instanceof Map) ? values[2] : [:]
-        stageInfraScope[key] = stageOpts.slurmDispatcher ? InfraFailure.SLURM : InfraFailure.K8S
+        def usesSlurm = stageOpts.slurmDispatcher ?: false
+        def maintenanceScope = usesSlurm ? "Slurm" : "K8s"
+        def maintenanceMatchKey = getMaintenanceMatchKey(key)
+        def maintenanceMatches = findMaintenanceMatches(
+            maintenanceMatchKey,
+            globalVars[MAINTENANCE_ENTRIES]
+        )
+        stageInfraScope[key] = usesSlurm ? InfraFailure.SLURM : InfraFailure.K8S
         [key, {
         stage(key) {
             if (key in testFilter[REUSE_STAGE_LIST]) {
                 stage("Skip - Reused") {
                     echo "Skip - Passed in the previous pipelines."
                 }
+            } else if (maintenanceMatches) {
+                showMaintenanceSkip(
+                    key,
+                    maintenanceMatchKey,
+                    maintenanceScope,
+                    maintenanceMatches,
+                    globalVars[MAINTENANCE_CONFIG_SHA]
+                )
             } else if (values instanceof List) {
                 // parallelJobs entries are either [podSpec, runner] or
                 // [podSpec, runner, opts] where opts is a Map passed through
@@ -7093,28 +7271,29 @@ def launchTestJobs(pipeline, testFilter, globalVars)
 
 
 def launchTestJobsForImagesSanityCheck(pipeline, globalVars) {
+    prepareMaintenanceResolution(IMAGE_SANITY_STAGE_NAMES, globalVars)
     def testConfigs = [
         "NGC Devel Image amd64": [
-            name: "NGC-Devel-Image-amd64-Sanity-Test",
+            name: IMAGE_SANITY_STAGE_NAMES[0],
             k8sArch: "amd64",
             wheelInstalled: false,
             config: VANILLA_CONFIG,
         ],
         "NGC Devel Image arm64": [
-            name: "NGC-Devel-Image-arm64-Sanity-Test",
+            name: IMAGE_SANITY_STAGE_NAMES[1],
             k8sArch: "arm64",
             wheelInstalled: false,
             config: LINUX_AARCH64_CONFIG,
         ],
         "NGC Release Image amd64": [
-            name: "NGC-Release-Image-amd64-Sanity-Test-A10",
+            name: IMAGE_SANITY_STAGE_NAMES[2],
             gpuType: "a10",
             k8sArch: "amd64",
             wheelInstalled: true,
             config: VANILLA_CONFIG,
         ],
         "NGC Release Image arm64": [
-            name: "NGC-Release-Image-arm64-Sanity-Test-GH200",
+            name: IMAGE_SANITY_STAGE_NAMES[3],
             gpuType: "gh200",
             k8sArch: "arm64",
             wheelInstalled: true,
@@ -7148,8 +7327,20 @@ def launchTestJobsForImagesSanityCheck(pipeline, globalVars) {
     println testConfigs
 
     def testJobs = testConfigs.collectEntries { key, values -> [values.name, {
-        if (values.wheelInstalled) {
-            stage(values.name) {
+        stage(values.name) {
+            def maintenanceMatches = findMaintenanceMatches(
+                values.name,
+                globalVars[MAINTENANCE_ENTRIES]
+            )
+            if (maintenanceMatches) {
+                showMaintenanceSkip(
+                    values.name,
+                    values.name,
+                    "K8s",
+                    maintenanceMatches,
+                    globalVars[MAINTENANCE_CONFIG_SHA]
+                )
+            } else if (values.wheelInstalled) {
                 echo "Run ${values.name} sanity test."
                 imageSanitySpec = createKubernetesPodConfig(values.image, values.gpuType, values.k8sArch)
                 runKubernetesPodWithInfraRetry(pipeline, imageSanitySpec, "trt-llm", values.name, { attemptTag, isFinalAttempt, retryContext = null ->
@@ -7157,9 +7348,7 @@ def launchTestJobsForImagesSanityCheck(pipeline, globalVars) {
                     trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get update && apt-get install -y git rsync curl")
                     runLLMTestlistOnPlatform(pipeline, values.gpuType, "l0_sanity_check", values.config, false, values.name, 1, 1, true, null, "-SubJob-TestImage" + attemptTag, isFinalAttempt, retryContext)
                 })
-            }
-        } else {
-            stage(values.name) {
+            } else {
                 imageSanitySpec = createKubernetesPodConfig(values.image, "build", values.k8sArch)
                 trtllm_utils.launchKubernetesPod(pipeline, imageSanitySpec, "trt-llm", {
                     sh "env | sort"
@@ -7212,6 +7401,9 @@ pipeline {
                     globalVars = trtllm_utils.updateMapWithJson(this, globalVars, env.globalVars, "globalVars")
                     globalVars = trtllm_utils.initializeCiBudget(this, globalVars, 24, 'HOURS', 'L0_Test')
                     globalVars[ACTION_INFO] = trtllm_utils.setupPipelineDescription(this, globalVars[ACTION_INFO])
+                    GlobalState.maintenanceResolution = []
+                    GlobalState.maintenanceSkipRecords = []
+                    GlobalState.maintenanceWarnings = []
                 }
             }
         }
@@ -7323,6 +7515,7 @@ pipeline {
                         } catch (Exception sweepErr) {
                             echo "[SLURM-FINALIZER] post-build sweep error: ${sweepErr}"
                         }
+                        uploadMaintenanceReport(this, globalVars)
                     }
                 }
             }
